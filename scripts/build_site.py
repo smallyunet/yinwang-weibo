@@ -159,10 +159,12 @@ def _post_html(p: Dict[str, Any]) -> str:
             f"</div>"
         )
 
+        r"https?://weibo\.cn/sinaurl\?u=([^\"'&]+)"
+    
     return (
         f"<article class='post' id='post-{pid}' data-year='{year}' data-month='{month}'>"
         f"<div class='meta'>"
-        f"  <span class='date'>{created_str}</span>"
+        f"  <span class='date'><a href='#post-{pid}' class='permalink'>{created_str}</a></span>"
         f"  <span class='source'>{source_txt}</span>"
         f"</div>"
         f"<div class='content'>"
@@ -420,28 +422,95 @@ def build(in_dir: Path, out_dir: Path, title: str) -> None:
     const lightbox = document.getElementById('lightbox');
     const lightboxImg = document.getElementById('lightboxImg');
     
-    let currentFilter = 'all';
+    // State
+    const urlParams = new URLSearchParams(window.location.search);
+    let currentFilter = urlParams.get('date') || 'all';
+    let currentSearch = urlParams.get('q') || '';
+
+    // Init
+    function init() {{
+        // Restore search input
+        if (currentSearch) {{
+            searchInput.value = currentSearch;
+        }}
+
+        // Restore active nav
+        if (currentFilter) {{
+            navItems.forEach(n => n.classList.remove('active'));
+            // Find the item with date-filter == currentFilter
+            // Note: 'all' is a special case
+            const target = Array.from(navItems).find(n => n.getAttribute('data-filter') === currentFilter);
+            if (target) {{
+                target.classList.add('active');
+            }} else {{
+                // Fallback to all if not found
+                document.querySelector('[data-filter="all"]').classList.add('active');
+            }}
+        }}
+
+        // Apply filters
+        filterPosts(currentFilter, currentSearch);
+
+        // Handle Hash (Anchor)
+        const hash = window.location.hash;
+        if (hash) {{
+            const targetId = hash.substring(1); // remove #
+            const targetEl = document.getElementById(targetId);
+            if (targetEl) {{
+                if (targetEl.style.display === 'none') {{
+                    // Force switch to 'all' to ensure visibility
+                    console.log("Deep linked post hidden by filter, switching to 'all'.");
+                    updateState('all', ''); // Reset filters
+                    
+                    // Update UI
+                    navItems.forEach(n => n.classList.remove('active'));
+                    document.querySelector('[data-filter="all"]').classList.add('active');
+                    searchInput.value = '';
+                }}
+                
+                setTimeout(() => {{
+                    targetEl.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+                    targetEl.classList.add('highlight');
+                }}, 500);
+            }}
+        }}
+    }}
 
     // 1. Search Logic
     searchInput.addEventListener('input', (e) => {{
-      const term = e.target.value.toLowerCase().trim();
-      filterPosts(currentFilter, term);
+        const term = e.target.value.toLowerCase().trim();
+        updateState(currentFilter, term);
     }});
     
     // 2. Nav Logic
     navItems.forEach(item => {{
         item.addEventListener('click', () => {{
-            // Clean active classes
+             // Clean active classes
             navItems.forEach(n => n.classList.remove('active'));
             item.classList.add('active');
             
-            currentFilter = item.getAttribute('data-filter');
-            filterPosts(currentFilter, searchInput.value.toLowerCase().trim());
+            const newFilter = item.getAttribute('data-filter');
+            updateState(newFilter, searchInput.value.toLowerCase().trim());
             
             // Scroll top
             window.scrollTo(0, 0);
         }});
     }});
+
+    function updateState(filter, search) {{
+        currentFilter = filter;
+        currentSearch = search;
+        
+        filterPosts(filter, search);
+        
+        // Update URL
+        const params = new URLSearchParams();
+        if (filter !== 'all') params.set('date', filter);
+        if (search) params.set('q', search);
+        
+        const newUrl = window.location.pathname + (params.toString() ? '?' + params.toString() : '');
+        window.history.replaceState({{}}, '', newUrl);
+    }}
 
     function filterPosts(filter, searchTerm) {{
         posts.forEach(post => {{
@@ -473,6 +542,9 @@ def build(in_dir: Path, out_dir: Path, title: str) -> None:
     lightbox.addEventListener('click', () => {{
         lightbox.classList.remove('active');
     }});
+
+    // Run
+    init();
   </script>
 </body>
 </html>
