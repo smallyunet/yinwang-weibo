@@ -373,14 +373,104 @@ def build(in_dir: Path, out_dir: Path, title: str) -> None:
     #lightbox img {{ max-width: 90%; max-height: 90%; box-shadow: 0 0 20px rgba(0,0,0,0.5); border-radius: 4px; }}
     #lightbox.active {{ display: flex; }}
 
-    /* MOBILE */
+    /* MOBILE: App-like Experience */
     @media (max-width: 768px) {{
-        body {{ flex-direction: column; }}
-        .sidebar {{ width: 100%; height: auto; position: static; border-right: none; border-bottom: 1px solid var(--border); padding: 16px; }}
-        .nav-group {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }}
-        .nav-year {{ width: 100%; }}
-        .nav-item {{ border: 1px solid var(--border); }}
-        .main-content {{ padding: 20px 16px; }}
+        body {{ 
+            flex-direction: column; 
+            background: var(--card-bg); /* Seamless background */
+        }}
+        
+        /* Header: Not sticky, clean background */
+        .sidebar {{ 
+            width: 100%; 
+            height: auto; 
+            position: relative; /* Let it scroll away */
+            border-right: none; 
+            border-bottom: 1px solid var(--border); 
+            padding: 16px 20px; 
+            background: var(--card-bg); 
+            z-index: 10;
+        }}
+
+        .brand {{ 
+            margin-bottom: 12px; 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+        }}
+        .brand h1 {{ font-size: 20px; margin: 0; }}
+        
+        .search-sub {{ 
+            margin-bottom: 16px; 
+            background: var(--bg);
+            border: none;
+            padding: 10px 14px;
+            font-size: 15px;
+        }}
+
+        /* Navigation: Chips */
+        #navMenu {{
+            display: flex;
+            overflow-x: auto;
+            gap: 10px;
+            padding-bottom: 4px;
+            -webkit-overflow-scrolling: touch;
+            white-space: nowrap;
+            scrollbar-width: none; 
+            -ms-overflow-style: none;
+        }}
+        #navMenu::-webkit-scrollbar {{ display: none; }}
+        
+        .nav-group {{ 
+            display: flex; 
+            flex-wrap: nowrap;
+            gap: 10px; 
+            margin: 0;
+            flex-shrink: 0;
+            align-items: center;
+        }}
+        
+        .nav-year {{ display: none; }} /* Hide year, implied by context or redundant */
+        
+        .nav-item {{
+            font-size: 14px;
+            padding: 8px 16px;
+            border-radius: 20px; /* Pill shape */
+            background: var(--bg);
+            color: var(--text-main);
+            border: none;
+            font-weight: 500;
+        }}
+        .nav-item.active {{
+            background: var(--accent);
+            color: white;
+            box-shadow: 0 4px 12px rgba(235, 85, 45, 0.25);
+        }}
+        .nav-item .count {{
+            font-size: 11px;
+            opacity: 0.8;
+            margin-left: 4px;
+        }}
+
+        /* Feed: Full width, Clean */
+        .main-content {{ 
+            padding: 0; 
+            max-width: 100%; 
+        }}
+        
+        .post {{ 
+            box-shadow: none;
+            border-radius: 0;
+            margin-bottom: 0;
+            border-bottom: 1px solid var(--border);
+            padding: 24px 20px;
+        }}
+        .post:last-child {{ border-bottom: none; }}
+        
+        /* Typography adjustments for mobile */
+        .text {{ font-size: 17px; line-height: 1.7; }}
+        .meta {{ margin-bottom: 14px; }}
+        
         .pics-1 {{ max-width: 100%; }}
     }}
   </style>
