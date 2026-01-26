@@ -276,60 +276,23 @@ def _download_pics_for_post(
     return out
 
 
-def get_cookie_from_browser(uid: str, manual_auth: bool = False, headless: bool = False) -> str:
-    """
-    Launches a browser (Playwright), navigates to the user's profile to initialize session/cookies,
-    and returns the cookie string.
-    """
-    if not HAS_PLAYWRIGHT:
-        raise ImportError("Playwright is not installed. Please run `pip install playwright` and `playwright install`.")
-
-    with sync_playwright() as p:
-        # If manual_auth is True, we must show the browser (headless=False)
-        # otherwise respect the 'headless' arg.
-        is_headless = headless and not manual_auth
-        
-        print(f"Launching browser (headless={is_headless})...")
-        browser = p.chromium.launch(headless=is_headless)
-        context = browser.new_context(
-            user_agent=DEFAULT_UA,
-            viewport={"width": 390, "height": 844},  # Mobile view
-            device_scale_factor=3,
-            is_mobile=True,
-            has_touch=True,
-        )
-        page = context.new_page()
-        
-        url = f"https://m.weibo.cn/u/{uid}"
-        print(f"Navigating to profile: {url}")
-        page.goto(url, wait_until="networkidle")
-        
-        if manual_auth:
-            print("-" * 60)
-            print("NOTICE: Browser window is open.")
-            print("Please log in or verify you can see the content in the browser window.")
-            print("When ready, press Enter here to capture cookies and proceed.")
-            print("-" * 60)
-            input("Press Enter to continue...")
-        else:
-            # Wait a bit to ensure potential guest session or risk control checks pass
-            print("Waiting 5 seconds for session initialization...")
-            time.sleep(5)
-            
-        cookies = context.cookies()
-        if not cookies:
-             # retry once
-             time.sleep(2)
-             cookies = context.cookies()
-
-        cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-        print(f"Captured {len(cookies)} cookies.")
-        
-        browser.close()
-        return cookie_str
+def _save_batch(jsonl_path: Path, posts: List[WeiboPost], existing_ids: Set[str], req_session: requests.Session, images_root: Path) -> None:
+    # Helper to save any pending unique posts when stopping early
+    unique_batch = []
+    for p in posts:
+        if p.id not in existing_ids:
+            unique_batch.append(p)
+            existing_ids.add(p.id)
+    
+    if unique_batch:
+        for p in unique_batch:
+            if p.pics:
+                    p.pics = _download_pics_for_post(req_session, p, images_root)
+        _append_posts(jsonl_path, unique_batch)
+        print(f"Saved final batch of {len(unique_batch)} posts before stopping.")
 
 
-def fetch_all(
+def fetch_via_browser_intercept(
     uid: str,
     out_dir: Path,
     cookie: Optional[str],
@@ -337,173 +300,248 @@ def fetch_all(
     sleep_min: float,
     sleep_max: float,
     stop_when_seen: bool,
+    manual_auth: bool = False,
+    headless: bool = False,
+    max_no_new_scrolls: int = 5,
 ) -> None:
+    if not HAS_PLAYWRIGHT:
+        raise ImportError("Playwright is not installed. Please run `pip install playwright` and `playwright install`.")
+
     jsonl_path = out_dir / "posts.jsonl"
     images_root = out_dir / "images"
+    
+    # Always load existing IDs to prevent duplicates in the file
+    existing_ids = _load_existing_ids(jsonl_path)
+    print(f"Loaded {len(existing_ids)} existing post IDs.")
 
-    existing_ids = _load_existing_ids(jsonl_path) if stop_when_seen else set()
+    # We need a requests session for downloading images later.
+    # We will initialize it after we get cookies from the browser.
+    req_session: Optional[requests.Session] = None
 
-    session = _requests_session(cookie)
-
-    containerid = f"107603{uid}"
-    base_url = "https://m.weibo.cn/api/container/getIndex"
-
-    since_id: Optional[str] = None
-    page = 0
-    new_count = 0
-
-    while True:
-        page += 1
-        params = {
-            "type": "uid",
-            "value": uid,
-            "containerid": containerid,
-        }
-        if since_id:
-            params["since_id"] = since_id
-
-        r = session.get(base_url, params=params, timeout=30)
+    with sync_playwright() as p:
+        # If manual_auth is True, we must show the browser
+        is_headless = headless and not manual_auth
         
-        try:
-             payload = _parse_json_response(r)
-        except RuntimeError as e:
-            # If we fail and we are not using browser, maybe warn?
-            # But the caller might want to know.
-            print(f"Error fetching page {page}: {e}")
-            break
+        print(f"Launching browser (headless={is_headless})...")
+        browser = p.chromium.launch(headless=is_headless)
+        context = browser.new_context(
+            user_agent=DEFAULT_UA,
+            viewport={"width": 390, "height": 844},
+            device_scale_factor=3,
+            is_mobile=True,
+            has_touch=True,
+        )
+        page = context.new_page()
 
-        try:
-            _ensure_ok(payload, r.url)
-        except RuntimeError as e:
-            print(f"Error checking API ok status on page {page}: {e}")
-            break
-
-        cards, next_since_id = _extract_cards(payload)
-
-        if not cards:
-            print(f"No cards found on page {page}. Stopping.")
-            break
-
-        mblogs = list(_iter_mblogs_from_cards(cards))
-        if not mblogs:
-            print(f"No mblog entries found on page {page}. Stopping.")
-            break
-
-        posts: List[WeiboPost] = []
-        for mblog in mblogs:
-            post = _to_post(mblog, uid)
-            if not post.id:
-                continue
-
-            if stop_when_seen and post.id in existing_ids:
-                # When paging from newest to oldest, once we hit an existing ID,
-                # the remaining pages are typically all older. Stop to avoid re-fetching.
-                _append_posts(jsonl_path, posts)
-                print(f"Encoutered existing post {post.id}. Stopping (stop-when-seen).")
-                return
-
-            # Download images and store local paths
-            if post.pics:
-                post.pics = _download_pics_for_post(session, post, images_root)
-
-            posts.append(post)
-            new_count += 1
+        # Shared state for the interceptor
+        captured_posts: List[WeiboPost] = []
         
-        if posts:
-            _append_posts(jsonl_path, posts)
-            print(f"Page {page}: saved {len(posts)} posts. (Total new: {new_count})")
+        def handle_response(response):
+            if "getIndex" in response.url and response.status == 200:
+                try:
+                    json_body = response.json()
+                    # Basic validation
+                    if not isinstance(json_body, dict):
+                        return
+                    
+                    # Parse using existing helpers
+                    cards, _ = _extract_cards(json_body)
+                    mblogs = list(_iter_mblogs_from_cards(cards))
+                    
+                    new_batch = []
+                    for mblog in mblogs:
+                        post = _to_post(mblog, uid)
+                        if post.id and post.id not in existing_ids:
+                             new_batch.append(post)
 
-        since_id = next_since_id
-        if not since_id:
-            print("No next_since_id. Reached end of timeline.")
-            break
+                    if new_batch:
+                        captured_posts.extend(new_batch)
+                        print(f"  -> Intercepted {len(new_batch)} new posts from API response.")
+                except Exception:
+                    # Ignore parsing errors from unrelated requests
+                    pass
 
-        if max_pages is not None and page >= max_pages:
-            print(f"Reached max_pages ({max_pages}). Stopping.")
-            break
+        # Register listener
+        page.on("response", handle_response)
 
-        time.sleep(random.uniform(sleep_min, sleep_max))
+        url = f"https://m.weibo.cn/u/{uid}"
+        print(f"Navigating to profile: {url}")
+        page.goto(url, wait_until="networkidle")
 
-    print(f"Done. New posts appended: {new_count}")
+        if manual_auth:
+            print("-" * 60)
+            print("NOTICE: Browser window is open.")
+            print("Please log in if needed. The script will wait for you to press Enter.")
+            print("AFTER you log in, verify you can see the content.")
+            print("-" * 60)
+            input("Press Enter to start scrolling and scraping...")
+        else:
+            print("Waiting few seconds for initial load...")
+            time.sleep(3)
+
+        # Sync cookies to requests session for image downloading
+        cookies = context.cookies()
+        cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+        req_session = _requests_session(cookie_str)
+        print(f"Synced {len(cookies)} cookies to image downloader.")
+
+        # Scrolling loop
+        print("Starting auto-scroll...")
+        
+        # We track how many posts we have processed to determine if we should stop
+        total_saved = 0
+        consecutive_no_new = 0
+        # MAX_NO_NEW_SCROLLS was 5
+        
+        scroll_count = 0
+        
+        while True:
+            scroll_count += 1
+            if max_pages and scroll_count > max_pages * 5: 
+                # Approx conversion: 1 page ~ 5 scrolls? 
+                # Let's just treat max_pages as max_scroll_blocks or ignore it.
+                # User asked for ALL content, so let's be generous.
+                pass
+
+            # Scroll down
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            
+            # Random wait for loading
+            sleep_time = random.uniform(sleep_min, sleep_max) + 1.0 # Add bit more for network
+            time.sleep(sleep_time)
+            
+            # Process captured posts
+            if captured_posts:
+                # Check for stop_when_seen BEFORE filtering
+                if stop_when_seen:
+                    # If any of the captured posts are already known, it implies we hit the "old" part of timeline.
+                    # (Assuming reverse chronological order implementation by Weibo)
+                    for p in captured_posts:
+                        if p.id in existing_ids:
+                            print(f"Encountered existing post {p.id}. Stopping (stop-when-seen).")
+                            _save_batch(jsonl_path, captured_posts, existing_ids, req_session, images_root)
+                            return
+
+                # Deduplicate and save
+                unique_batch = []
+                for p in captured_posts:
+                    if p.id not in existing_ids:
+                        unique_batch.append(p)
+                        existing_ids.add(p.id)
+                
+                captured_posts.clear() # Clear buffer
+                
+                if unique_batch:
+                    # Download images
+                    for p in unique_batch:
+                        if p.pics:
+                             p.pics = _download_pics_for_post(req_session, p, images_root)
+                    
+                    _append_posts(jsonl_path, unique_batch)
+                    total_saved += len(unique_batch)
+                    print(f"Scroll {scroll_count}: Saved {len(unique_batch)} posts. (Total: {total_saved})")
+                    consecutive_no_new = 0
+                else:
+                    print(f"Scroll {scroll_count}: No new unique posts found (duplicates filtered).")
+                    consecutive_no_new += 1
+            else:
+                print(f"Scroll {scroll_count}: No API responses intercepted.")
+                consecutive_no_new += 1
+
+            if consecutive_no_new >= max_no_new_scrolls:
+                print(f"No new content for {max_no_new_scrolls} consecutive scrolls. Stopping.")
+                break
+                
+            # If "End" text is visible, maybe stop? 
+            # Weibo mobile usually just stops loading.
+            
+        print(f"Done. Total posts saved: {total_saved}")
+        browser.close()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--uid", default="6347862377")
     parser.add_argument("--out", default="data")
-    parser.add_argument("--cookie", default=None, help="Cookie string; defaults to env WEIBO_COOKIE.")
+    parser.add_argument("--cookie", default=None, help="Cookie string (used for API-only mode).")
     parser.add_argument("--max-pages", type=int, default=None)
-    parser.add_argument("--sleep-min", type=float, default=0.8)
-    parser.add_argument("--sleep-max", type=float, default=1.8)
+    parser.add_argument("--sleep-min", type=float, default=1.0)
+    parser.add_argument("--sleep-max", type=float, default=2.5)
     parser.add_argument(
         "--stop-when-seen",
         action="store_true",
-        help="If posts.jsonl exists, stop when reaching an existing post ID (good for incremental updates)",
+        help="Stop when reaching an existing post ID",
     )
-    # Browser arguments
+    
     parser.add_argument(
         "--manual-auth",
         action="store_true",
-        help="Open browser window for manual login/verification before scraping",
+        help="Open browser logic with manual login pause.",
+    )
+    parser.add_argument(
+        "--api-only",
+        action="store_true",
+        help="Force using the old API-only method (no browser scrolling).",
     )
     parser.add_argument(
         "--headless",
         action="store_true",
-        help="Run browser in headless mode (default: False if manual-auth is not set, otherwise True)",
+        help="Run browser in headless mode (default False for debugging/visibility).",
+    )
+    parser.add_argument(
+        "--max-no-new-scrolls",
+        type=int,
+        default=5,
+        help="Stop after this many scrolls with no new content (default 5). Set higher (e.g. 100) to force deeper scrolling.",
     )
 
     args = parser.parse_args()
 
     out_dir = Path(args.out)
     
-    # Logic:
-    # 1. If --manual-auth is set, force browser to get new cookie.
-    # 2. Else if valid cookie provided (arg or env), use it.
-    # 3. Else try auto browser (headless).
+    # Decide mode
+    # Default to Browser Intercept because API is flaky
+    use_browser = True
+    if args.api_only:
+        use_browser = False
+    elif not HAS_PLAYWRIGHT:
+        print("Playwright not installed, falling back to API-only mode.")
+        use_browser = False
 
-    cookie = args.cookie or os.environ.get("WEIBO_COOKIE")
-    use_browser = False
-
-    if args.manual_auth:
-        print("Manual auth requested. Ignoring provided cookie (if any) and launching browser.")
-        use_browser = True
-    elif not cookie:
-        print("No cookie provided via --cookie or WEIBO_COOKIE.")
-        use_browser = True
-    
     if use_browser:
-        if HAS_PLAYWRIGHT:
-            print("Attempting to fetch cookie via Playwright browser...")
-            try:
-                # If manual_auth is on -> headless=False
-                # If not manual_auth -> headless=True (default automation behavior) or respect args.headless
-                
-                should_be_headless = args.headless
-                if args.manual_auth:
-                    should_be_headless = False
-                
-                cookie = get_cookie_from_browser(args.uid, manual_auth=args.manual_auth, headless=should_be_headless)
-            except Exception as e:
-                print(f"Browser auth failed: {e}")
-                print("Tip: Run `playwright install` to install browsers.")
-                sys.exit(1)
-        else:
-            print("Playwright not installed. Cannot use browser automation.")
-            print("Install it with: pip install playwright && playwright install")
-            print("Or provide a cookie manually.")
-            sys.exit(1)
-    else:
-        print("Using provided cookie string/env var.")
+        print("Using Browser Intercept Mode (Recommended).")
+        # headless default: 
+        # If manual-auth -> False
+        # If not manual-auth -> True if set, else False (wait, user might want to see it running)
+        # Let's keep it visible by default as user requested "directly open browser".
+        is_headless = args.headless
+        if args.manual_auth:
+             is_headless = False
 
-    fetch_all(
-        uid=str(args.uid),
-        out_dir=out_dir,
-        cookie=cookie,
-        max_pages=args.max_pages,
-        sleep_min=args.sleep_min,
-        sleep_max=args.sleep_max,
-        stop_when_seen=bool(args.stop_when_seen),
-    )
+        fetch_via_browser_intercept(
+            uid=str(args.uid),
+            out_dir=out_dir,
+            cookie=None, # Cookie will be grabbed from browser
+            max_pages=args.max_pages,
+            sleep_min=args.sleep_min,
+            sleep_max=args.sleep_max,
+            stop_when_seen=bool(args.stop_when_seen),
+            manual_auth=args.manual_auth,
+            headless=is_headless,
+            max_no_new_scrolls=args.max_no_new_scrolls,
+        )
+    else:
+        print("Using Legacy API Mode.")
+        cookie = args.cookie or os.environ.get("WEIBO_COOKIE")
+        fetch_all(
+            uid=str(args.uid),
+            out_dir=out_dir,
+            cookie=cookie,
+            max_pages=args.max_pages,
+            sleep_min=args.sleep_min,
+            sleep_max=args.sleep_max,
+            stop_when_seen=bool(args.stop_when_seen),
+        )
 
 
 if __name__ == "__main__":
