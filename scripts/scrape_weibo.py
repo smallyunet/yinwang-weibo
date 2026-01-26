@@ -49,6 +49,7 @@ class WeiboPost:
     attitudes_count: Optional[int]
     is_retweet: bool
     retweeted_status: Optional[Dict[str, Any]]
+    is_long_text: bool = False  # New field
 
 
 def _strip_html(html: str) -> str:
@@ -195,6 +196,7 @@ def _to_post(mblog: Dict[str, Any], uid: str) -> WeiboPost:
         attitudes_count=mblog.get("attitudes_count"),
         is_retweet=is_retweet,
         retweeted_status=retweeted,
+        is_long_text=bool(mblog.get("isLongText")),
     )
 
 
@@ -276,6 +278,23 @@ def _download_pics_for_post(
     return out
 
 
+def _fetch_long_text(session: requests.Session, pid: str) -> Optional[str]:
+    """
+    Fetches the full long text content for a post.
+    Returns the HTML content or None if failed.
+    """
+    url = f"https://m.weibo.cn/statuses/extend?id={pid}"
+    try:
+        r = session.get(url, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            # data['data']['longTextContent']
+            return (data.get("data") or {}).get("longTextContent")
+    except Exception as e:
+        print(f"Warning: Failed to fetch long text for {pid}: {e}")
+    return None
+
+
 def _save_batch(jsonl_path: Path, posts: List[WeiboPost], existing_ids: Set[str], req_session: requests.Session, images_root: Path) -> None:
     # Helper to save any pending unique posts when stopping early
     unique_batch = []
@@ -285,9 +304,22 @@ def _save_batch(jsonl_path: Path, posts: List[WeiboPost], existing_ids: Set[str]
             existing_ids.add(p.id)
     
     if unique_batch:
+        # 1. Fetch long text if needed
         for p in unique_batch:
-            if p.pics:
+            if p.is_long_text and req_session:
+                print(f"  Fetching long text for {p.id}...")
+                long_html = _fetch_long_text(req_session, p.id)
+                if long_html:
+                    p.text_html = long_html
+                    p.text_plain = _strip_html(long_html)
+                    # Small sleep to be nice
+                    time.sleep(0.5)
+
+        # 2. Download images
+        for p in unique_batch:
+            if p.pics and req_session:
                     p.pics = _download_pics_for_post(req_session, p, images_root)
+        
         _append_posts(jsonl_path, unique_batch)
         print(f"Saved final batch of {len(unique_batch)} posts before stopping.")
 
@@ -403,11 +435,32 @@ def fetch_via_browser_intercept(
                 # User asked for ALL content, so let's be generous.
                 pass
 
-            # Scroll down
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            # Human-like scrolling behavior
+            # 1. Scroll down variable amount (mostly one screen)
+            scroll_y = random.randint(800, 1500)
+            page.evaluate(f"window.scrollBy(0, {scroll_y})")
             
-            # Random wait for loading
-            sleep_time = random.uniform(sleep_min, sleep_max) + 1.0 # Add bit more for network
+            # 2. Randomly move mouse to simulate reading/interaction
+            try:
+                page.mouse.move(random.randint(10, 300), random.randint(10, 800))
+            except Exception:
+                pass
+                
+            # 3. Occasional small scroll up (simulate re-reading) - 10% chance
+            if random.random() < 0.1:
+                time.sleep(1)
+                page.evaluate("window.scrollBy(0, -300)")
+                time.sleep(1)
+                page.evaluate("window.scrollBy(0, 300)")
+
+            # Random wait for loading (Human read time)
+            sleep_time = random.uniform(sleep_min, sleep_max)
+            # Add extra delays occasionally
+            if random.random() < 0.05:
+                # "Long pause"
+                print("  (Simulating user reading... pausing for 5s)")
+                sleep_time += 5.0
+            
             time.sleep(sleep_time)
             
             # Process captured posts
@@ -432,9 +485,19 @@ def fetch_via_browser_intercept(
                 captured_posts.clear() # Clear buffer
                 
                 if unique_batch:
-                    # Download images
+                    # 1. Fetch long text
                     for p in unique_batch:
-                        if p.pics:
+                        if p.is_long_text and req_session:
+                            print(f"  Fetching long text for {p.id}...")
+                            long_html = _fetch_long_text(req_session, p.id)
+                            if long_html:
+                                p.text_html = long_html
+                                p.text_plain = _strip_html(long_html)
+                                time.sleep(random.uniform(0.3, 0.8))
+
+                    # 2. Download images
+                    for p in unique_batch:
+                        if p.pics and req_session:
                              p.pics = _download_pics_for_post(req_session, p, images_root)
                     
                     _append_posts(jsonl_path, unique_batch)
@@ -447,6 +510,10 @@ def fetch_via_browser_intercept(
             else:
                 print(f"Scroll {scroll_count}: No API responses intercepted.")
                 consecutive_no_new += 1
+            
+            if consecutive_no_new > 2:
+                print("  [Tip] If you see a CAPTCHA in the browser, please solve it manually ASAP.")
+
 
             if consecutive_no_new >= max_no_new_scrolls:
                 print(f"No new content for {max_no_new_scrolls} consecutive scrolls. Stopping.")
@@ -465,8 +532,8 @@ def main() -> None:
     parser.add_argument("--out", default="data")
     parser.add_argument("--cookie", default=None, help="Cookie string (used for API-only mode).")
     parser.add_argument("--max-pages", type=int, default=None)
-    parser.add_argument("--sleep-min", type=float, default=1.0)
-    parser.add_argument("--sleep-max", type=float, default=2.5)
+    parser.add_argument("--sleep-min", type=float, default=2.0)
+    parser.add_argument("--sleep-max", type=float, default=5.0)
     parser.add_argument(
         "--stop-when-seen",
         action="store_true",
