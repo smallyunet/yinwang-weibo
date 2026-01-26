@@ -4,10 +4,13 @@
 import argparse
 import html
 import json
+import re
 import shutil
+import urllib.parse
 from datetime import datetime
+from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from dateutil import parser as date_parser
 
@@ -61,12 +64,38 @@ def _fmt_date(iso: str) -> str:
     except Exception:
         return iso
 
+def _get_year_month(iso: str) -> Tuple[str, str]:
+    try:
+        dt = date_parser.parse(iso.replace("Z", "+00:00"))
+        return str(dt.year), f"{dt.year}-{dt.month:02d}"
+    except Exception:
+        return "Unknown", "Unknown"
+
+
+def _clean_weibo_links(html_content: str) -> str:
+    """
+    Replaces https://weibo.cn/sinaurl?u=... with the decoded direct URL.
+    """
+    if not html_content:
+        return ""
+    
+    def replacer(match):
+        encoded_url = match.group(1)
+        try:
+            return urllib.parse.unquote(encoded_url)
+        except Exception:
+            return encoded_url
+
+    # Regex looks for the u= parameter value until the next quote or ampersand
+    # Pattern: https://weibo.cn/sinaurl?u=([^"&' <]+)
+    pattern = r"https?://weibo\.cn/sinaurl\?u=([^\"'&]+)"
+    return re.sub(pattern, replacer, html_content)
+
 
 def _render_images(pics: List[Dict[str, Any]]) -> str:
     if not pics:
         return ""
     
-    # Logic for image grid structure
     count = len(pics)
     grid_class = "pics-1"
     if count == 1:
@@ -80,12 +109,10 @@ def _render_images(pics: List[Dict[str, Any]]) -> str:
     for pic in pics:
         lp = pic.get("local_path")
         if not lp:
-            # Fallback to remote URL if local not found?
-            # Ideally we only use local.
             continue
             
         src = f"assets/images/{html.escape(lp)}"
-        # Use a simple link for now, could be lightbox
+        # Use data-src for lightbox
         img_tag = (
             f"<a class='img-item' href='{src}' target='_blank' rel='noreferrer'>"
             f"<img loading='lazy' src='{src}' />"
@@ -101,50 +128,30 @@ def _render_images(pics: List[Dict[str, Any]]) -> str:
 
 def _post_html(p: Dict[str, Any]) -> str:
     pid = p.get("id")
-    created = html.escape(_fmt_date(p.get("created_at") or ""))
+    created_raw = p.get("created_at") or ""
+    created_str = html.escape(_fmt_date(created_raw))
+    year, month = _get_year_month(created_raw)
+    
     source = p.get("source")
     source_txt = ""
     if source:
-        source_txt = f" · {html.escape(source)}" 
-        # Source often contains HTML in raw data, but let's be careful. 
-        # If raw source has HTML tags, we might want to strip them or trust them?
-        # The scraper passes 'source' usually roughly clean or with simple tags. 
-        # Let's strip tags for safety/uniformity if needed, but existing code used it directly.
-        # Actually scrape_weibo.py passes raw source which might be "iPhone 13". 
-        # Sometimes it's link text. Let's strict escape to be safe.
+        source_txt = f" · {html.escape(source)}"
+    
+        source_txt = f" · {html.escape(source)}"
     
     text_html = p.get("text_html") or ""
+    text_html = _clean_weibo_links(text_html)
     
-    # Process images
     pics_html = _render_images(p.get("pics") or [])
     
-    # Handle Retweet
     retweet_html = ""
     if p.get("retweeted_status"):
         rt = p["retweeted_status"]
         rt_user = rt.get("user") or {}
         rt_user_name = rt_user.get("screen_name") or "Unknown"
+        rt_user_name = rt_user.get("screen_name") or "Unknown"
         rt_text = rt.get("text") or ""
-        # RT images
-        rt_pics = _render_images(p.get("pics") or []) # Wait, scraper logic puts RT pics in main pics?
-        # Actually standard Weibo logic: RT pics are in retweeted_status['pics'] usually.
-        # But our scraper flat structure might vary. 
-        # Checking scraper: it extracts pics from mblog. 
-        # If it's a retweet, mblog['pics'] usually contains the RT images?
-        # Or mblog['retweeted_status']['pics']?
-        # The scraper `_extract_pics` takes `mblog`. 
-        # If `mblog` has `pics`, it uses them. 
-        # Let's assume the `pics` field in our `WeiboPost` covers the images to be shown.
-        # If it's a pure retweet, usually the main post has no pics, the RT has pics.
-        # Our `WeiboPost` definition has `pics` and `retweeted_status`. 
-        # If `is_retweet` is True, usually the pics belong to the RT content. 
-        # But `scrape_weibo.py` logic: `_extract_pics(mblog)`. 
-        # If it is a retweet, the outer mblog might NOT have pics, but `retweeted_status` has.
-        # Let's check scraper behavior. Scraper runs `_extract_pics(mblog)`.
-        # Unless we updated scraper to dig into RT, we might miss RT pics if they are only inside `retweeted_status`.
-        # However, looking at `WeiboPost` dataclass, it serves the flattened view. 
-        # Let's stick to using `p.get("pics")` for now.
-        
+        rt_text = _clean_weibo_links(rt_text)
         retweet_html = (
             f"<div class='retweet'>"
             f"<div class='rt-user'>@{html.escape(rt_user_name)}</div>"
@@ -153,9 +160,9 @@ def _post_html(p: Dict[str, Any]) -> str:
         )
 
     return (
-        f"<article class='post' id='post-{pid}'>"
+        f"<article class='post' id='post-{pid}' data-year='{year}' data-month='{month}'>"
         f"<div class='meta'>"
-        f"  <span class='date'>{created}</span>"
+        f"  <span class='date'>{created_str}</span>"
         f"  <span class='source'>{source_txt}</span>"
         f"</div>"
         f"<div class='content'>"
@@ -167,17 +174,44 @@ def _post_html(p: Dict[str, Any]) -> str:
     )
 
 
+def _build_sidebar(posts: List[Dict[str, Any]]) -> str:
+    # Group by Year -> Month
+    tree = defaultdict(set)
+    for p in posts:
+        y, m = _get_year_month(p.get("created_at") or "")
+        if y != "Unknown":
+            tree[y].add(m)
+    
+    # Sort descending
+    years = sorted(tree.keys(), reverse=True)
+    
+    html_parts = []
+    html_parts.append("<div class='nav-group'>")
+    html_parts.append(f"<div class='nav-item active' data-filter='all'>All Posts <span class='count'>({len(posts)})</span></div>")
+    html_parts.append("</div>")
+
+    for y in years:
+        months = sorted(list(tree[y]), reverse=True)
+        html_parts.append("<div class='nav-group'>")
+        html_parts.append(f"<div class='nav-year'>{y}</div>")
+        for m in months:
+            # Count posts in this month
+            c = sum(1 for p in posts if _get_year_month(p.get("created_at") or "")[1] == m)
+            label = m.split("-")[1] # Just the month part "05"
+            # Format nicely? "2025-05" -> "05" works.
+            html_parts.append(f"<div class='nav-item' data-filter='{m}'>{y}-{label} <span class='count'>({c})</span></div>")
+        html_parts.append("</div>")
+    
+    return "\n".join(html_parts)
+
+
 def build(in_dir: Path, out_dir: Path, title: str) -> None:
     posts = _read_posts_deduplicated(in_dir / "posts.jsonl")
     posts = _sort_posts(posts)
 
-    if out_dir.exists():
-        # Maybe clean it? Or just overwrite.
-        pass
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / ".nojekyll").write_text("", encoding="utf-8")
 
-    # Copy images
     src_images = in_dir / "images"
     dst_images = out_dir / "assets" / "images"
     if src_images.exists():
@@ -185,9 +219,9 @@ def build(in_dir: Path, out_dir: Path, title: str) -> None:
         shutil.copytree(src_images, dst_images, dirs_exist_ok=True)
 
     rendered_posts = "\n".join(_post_html(p) for p in posts)
+    sidebar_html = _build_sidebar(posts)
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
     
-    # Premium CSS & Layout
     page_content = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -200,11 +234,12 @@ def build(in_dir: Path, out_dir: Path, title: str) -> None:
       --card-bg: #ffffff;
       --text-main: #1f2937;
       --text-sub: #6b7280;
-      --accent: #eb552d; /* Weibo Orange/Red */
+      --accent: #eb552d;
       --link: #4b89dc;
       --border: #eaeaea;
       --shadow: 0 1px 3px rgba(0,0,0,0.05);
       --radius: 12px;
+      --sidebar-width: 240px;
     }}
     @media (prefers-color-scheme: dark) {{
       :root {{
@@ -224,50 +259,74 @@ def build(in_dir: Path, out_dir: Path, title: str) -> None:
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
       line-height: 1.6;
       -webkit-font-smoothing: antialiased;
+      display: flex;
+      min-height: 100vh;
     }}
-
-    .container {{
-      max-width: 720px;
+    
+    /* SIDEBAR */
+    .sidebar {{
+      width: var(--sidebar-width);
+      background: var(--card-bg);
+      border-right: 1px solid var(--border);
+      height: 100vh;
+      position: sticky;
+      top: 0;
+      overflow-y: auto;
+      padding: 20px;
+      box-sizing: border-box;
+      flex-shrink: 0;
+    }}
+    
+    /* MAIN */
+    .main-content {{
+      flex-grow: 1;
+      padding: 40px;
+      max-width: 800px; /* Limit content width */
       margin: 0 auto;
-      padding: 40px 16px;
     }}
 
-    header {{
-      margin-bottom: 40px;
-      text-align: center;
+    /* Header in Sidebar */
+    .brand {{
+      margin-bottom: 30px;
     }}
-    h1 {{
-      margin: 0 0 8px 0;
-      font-size: 24px;
+    .brand h1 {{
+      font-size: 20px;
+      margin: 0 0 4px 0;
       font-weight: 700;
-      letter-spacing: -0.5px;
     }}
-    .stats {{
-      font-size: 13px;
+    .brand .stats {{
+      font-size: 12px;
       color: var(--text-sub);
     }}
     
-    .search-box {{
-      margin: 20px auto 0;
-      max-width: 400px;
-      position: relative;
-    }}
     .search-sub {{
         width: 100%;
-        padding: 10px 16px;
-        border-radius: 99px;
+        padding: 8px 12px;
+        border-radius: 6px;
         border: 1px solid var(--border);
-        background: var(--card-bg);
+        background: var(--bg);
         color: var(--text-main);
         font-size: 14px;
         outline: none;
-        box-sizing: border-box;
-        transition: all 0.2s;
+        margin-bottom: 20px;
     }}
-    .search-sub:focus {{
-        border-color: var(--accent);
-        box-shadow: 0 0 0 3px rgba(235, 85, 45, 0.1);
+    .search-sub:focus {{ border-color: var(--accent); }}
+
+    /* Nav Items */
+    .nav-group {{ margin-bottom: 20px; }}
+    .nav-year {{ font-weight: 700; font-size: 14px; margin-bottom: 8px; color: var(--text-main); }}
+    .nav-item {{
+        padding: 6px 10px;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 14px;
+        color: var(--text-sub);
+        display: flex;
+        justify-content: space-between;
     }}
+    .nav-item:hover {{ background: var(--bg); color: var(--text-main); }}
+    .nav-item.active {{ background: var(--accent); color: white; }}
+    .nav-item .count {{ opacity: 0.7; font-size: 12px; }}
 
     /* POST CARD */
     .post {{
@@ -276,31 +335,11 @@ def build(in_dir: Path, out_dir: Path, title: str) -> None:
       padding: 24px;
       margin-bottom: 24px;
       box-shadow: var(--shadow);
-      transition: transform 0.2s;
     }}
-    .post:hover {{
-      /* transform: translateY(-2px); subtle lift */
-    }}
-
-    .meta {{
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 12px;
-      font-size: 13px;
-      color: var(--text-sub);
-    }}
-    .date {{
-      font-weight: 500;
-    }}
-
-    .text {{
-      font-size: 16px;
-      margin-bottom: 12px;
-      overflow-wrap: break-word;
-    }}
+    .meta {{ display: flex; gap: 8px; margin-bottom: 12px; font-size: 13px; color: var(--text-sub); }}
+    .date {{ font-weight: 500; }}
+    .text {{ font-size: 16px; margin-bottom: 12px; overflow-wrap: break-word; }}
     
-    /* Retweet block */
     .retweet {{
       background: var(--bg);
       padding: 12px 16px;
@@ -309,112 +348,136 @@ def build(in_dir: Path, out_dir: Path, title: str) -> None:
       font-size: 14px;
       color: var(--text-sub);
     }}
-    .rt-user {{
-      font-weight: 600;
-      margin-bottom: 4px;
-      color: var(--text-main);
-    }}
+    .rt-user {{ font-weight: 600; margin-bottom: 4px; color: var(--text-main); }}
 
-    /* IMAGES GRID */
-    .pics {{
-      display: grid;
-      gap: 6px;
-      margin-top: 12px;
-    }}
-    .img-item {{
-      display: block;
-      position: relative;
-      overflow: hidden;
-      border-radius: 8px;
-      background: #f0f0f0;
-      cursor: zoom-in;
-    }}
-    .img-item img {{
-      display: block;
-      width: 100%;
-      height: 100%;
-      object-fit: cover;
-      transition: opacity 0.3s;
-    }}
-    
-    /* Grid variants */
-    .pics-1 {{
-      grid-template-columns: 1fr;
-      max-width: 60%; 
-    }}
-    .pics-1 .img-item {{
-      aspect-ratio: auto;
-      max-height: 500px;
-    }}
-    .pics-1 .img-item img {{
-        height: auto;
-        max-height: 500px;
-    }}
-
-    .pics-2 {{
-        grid-template-columns: repeat(2, 1fr);
-    }}
-    .pics-2 .img-item {{
-        aspect-ratio: 1; 
-    }}
-
-    .pics-3 {{
-        grid-template-columns: repeat(3, 1fr);
-    }}
-    .pics-3 .img-item {{
-        aspect-ratio: 1;
-    }}
+    /* IMAGES */
+    .pics {{ display: grid; gap: 6px; margin-top: 12px; }}
+    .img-item {{ display: block; position: relative; border-radius: 8px; background: #f0f0f0; overflow: hidden; cursor: zoom-in; }}
+    .img-item img {{ display: block; width: 100%; height: 100%; object-fit: cover; }}
+    .pics-1 {{ max-width: 60%; grid-template-columns: 1fr; }} 
+    .pics-1 .img-item {{ max-height: 500px; }}
+    .pics-1 .img-item img {{ height: auto; }}
+    .pics-2 {{ grid-template-columns: repeat(2, 1fr); }} .pics-2 .img-item {{ aspect-ratio: 1; }}
+    .pics-3 {{ grid-template-columns: repeat(3, 1fr); }} .pics-3 .img-item {{ aspect-ratio: 1; }}
     
     a {{ color: var(--link); text-decoration: none; }}
     a:hover {{ text-decoration: underline; }}
     
-    @media (max-width: 600px) {{
-        .container {{ padding: 20px 12px; }}
+    /* LIGHTBOX */
+    #lightbox {{
+        display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%;
+        background-color: rgba(0,0,0,0.9); align-items: center; justify-content: center;
+    }}
+    #lightbox img {{ max-width: 90%; max-height: 90%; box-shadow: 0 0 20px rgba(0,0,0,0.5); border-radius: 4px; }}
+    #lightbox.active {{ display: flex; }}
+
+    /* MOBILE */
+    @media (max-width: 768px) {{
+        body {{ flex-direction: column; }}
+        .sidebar {{ width: 100%; height: auto; position: static; border-right: none; border-bottom: 1px solid var(--border); padding: 16px; }}
+        .nav-group {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }}
+        .nav-year {{ width: 100%; }}
+        .nav-item {{ border: 1px solid var(--border); }}
+        .main-content {{ padding: 20px 16px; }}
         .pics-1 {{ max-width: 100%; }}
-        .post {{ padding: 16px; }}
     }}
   </style>
 </head>
 <body>
-  <div class="container">
-    <header>
-      <h1>{html.escape(title)}</h1>
-      <div class="stats">
-        {len(posts)} Posts · Generated {generated_at}
-      </div>
-      <div class="search-box">
-        <input type="text" class="search-sub" id="searchInput" placeholder="Search content or date..." />
-      </div>
-    </header>
 
+  <aside class="sidebar">
+    <div class="brand">
+      <h1>{html.escape(title)}</h1>
+      <div class="stats">{len(posts)} Posts</div>
+    </div>
+    
+    <input type="text" class="search-sub" id="searchInput" placeholder="Search..." />
+    
+    <div id="navMenu">
+        {sidebar_html}
+    </div>
+  </aside>
+
+  <main class="main-content">
     <div id="postsList">
       {rendered_posts}
     </div>
     
+    <div style="text-align:center; color:var(--text-sub); font-size:12px; margin-top:40px;">
+        Generated by yinwang-weibo-archiver at {generated_at}
+    </div>
+  </main>
+
+  <!-- Lightbox -->
+  <div id="lightbox">
+      <img id="lightboxImg" src="" />
   </div>
 
   <script>
     const searchInput = document.getElementById('searchInput');
-    const postsContainer = document.getElementById('postsList');
     const posts = document.querySelectorAll('.post');
+    const navItems = document.querySelectorAll('.nav-item');
+    const lightbox = document.getElementById('lightbox');
+    const lightboxImg = document.getElementById('lightboxImg');
+    
+    let currentFilter = 'all';
 
+    // 1. Search Logic
     searchInput.addEventListener('input', (e) => {{
       const term = e.target.value.toLowerCase().trim();
-      
-      posts.forEach(post => {{
-        const text = post.innerText.toLowerCase();
-        if (text.includes(term)) {{
-          post.style.display = 'block';
-        }} else {{
-          post.style.display = 'none';
-        }}
-      }});
+      filterPosts(currentFilter, term);
+    }});
+    
+    // 2. Nav Logic
+    navItems.forEach(item => {{
+        item.addEventListener('click', () => {{
+            // Clean active classes
+            navItems.forEach(n => n.classList.remove('active'));
+            item.classList.add('active');
+            
+            currentFilter = item.getAttribute('data-filter');
+            filterPosts(currentFilter, searchInput.value.toLowerCase().trim());
+            
+            // Scroll top
+            window.scrollTo(0, 0);
+        }});
+    }});
+
+    function filterPosts(filter, searchTerm) {{
+        posts.forEach(post => {{
+            const postYear = post.getAttribute('data-year');
+            const postMonth = post.getAttribute('data-month');
+            const text = post.innerText.toLowerCase();
+            
+            let matchesFilter = (filter === 'all') || (postMonth === filter);
+            let matchesSearch = !searchTerm || text.includes(searchTerm);
+            
+            if (matchesFilter && matchesSearch) {{
+                post.style.display = 'block';
+            }} else {{
+                post.style.display = 'none';
+            }}
+        }});
+    }}
+    
+    // 3. Lightbox Logic
+    document.querySelectorAll('.img-item').forEach(link => {{
+        link.addEventListener('click', (e) => {{
+            e.preventDefault();
+            const src = link.getAttribute('href');
+            lightboxImg.src = src;
+            lightbox.classList.add('active');
+        }});
+    }});
+    
+    lightbox.addEventListener('click', () => {{
+        lightbox.classList.remove('active');
     }});
   </script>
 </body>
 </html>
 """
-    
+
     (out_dir / "index.html").write_text(page_content, encoding="utf-8")
     print(f"Site built at {out_dir}/index.html")
 

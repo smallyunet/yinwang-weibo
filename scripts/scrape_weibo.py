@@ -555,17 +555,196 @@ def main() -> None:
         action="store_true",
         help="Run browser in headless mode (default False for debugging/visibility).",
     )
+def fix_existing_data(out_dir: Path, manual_auth: bool, headless: bool, uid: str) -> None:
+    """
+    Scans existing posts.jsonl and refetches full text for truncated posts.
+    """
+    if not HAS_PLAYWRIGHT:
+         raise ImportError("Playwright is required for this mode.")
+
+    jsonl_path = out_dir / "posts.jsonl"
+    if not jsonl_path.exists():
+        print("No data found to fix.")
+        return
+
+    # Load all posts
+    posts: List[WeiboPost] = []
+    with jsonl_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            try:
+                posts.append(WeiboPost(**json.loads(line)))
+            except Exception:
+                pass
+    
+    print(f"Loaded {len(posts)} posts. Scanning for truncated content...")
+    
+    # Identify candidates
+    candidates = []
+    for p in posts:
+        # Check explicit flag OR heuristic
+        # Heuristic: text ends with "全文" link or looks truncated
+        # The Weibo link text is usually <a href="...">全文</a>
+        needs_fix = p.is_long_text
+        if not needs_fix and "全文" in (p.text_html or ""):
+             needs_fix = True
+        
+        if needs_fix:
+            candidates.append(p)
+            
+    if not candidates:
+        print("No truncated posts found.")
+        return
+        
+    print(f"Found {len(candidates)} posts that might be truncated. Initializing browser for API session...")
+    
+    # Get session
+    with sync_playwright() as p:
+        is_headless = headless and not manual_auth
+        print(f"Launching browser (headless={is_headless})...")
+        browser = p.chromium.launch(headless=is_headless)
+        context = browser.new_context(
+            user_agent=DEFAULT_UA,
+            viewport={"width": 390, "height": 844},
+            device_scale_factor=3,
+            is_mobile=True,
+            has_touch=True,
+        )
+        page = context.new_page()
+        
+        # Go to profile to get cookie and look correct
+        url = f"https://m.weibo.cn/u/{uid}"
+        print(f"Navigating to profile: {url}")
+        page.goto(url, wait_until="networkidle")
+        
+        if manual_auth:
+             print("-" * 60)
+             print("Please log in if needed. Press Enter when ready.")
+             print("-" * 60)
+             input("Press Enter to continue...")
+        else:
+             time.sleep(3)
+             
+        cookies = context.cookies()
+        if not cookies:
+             # Retry
+             time.sleep(2)
+             cookies = context.cookies()
+             
+        cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+        req_session = _requests_session(cookie_str)
+        print(f"Session initialized with {len(cookies)} cookies.")
+        
+        fix_count = 0
+        consecutive_failures = 0
+        
+        for i, post in enumerate(candidates):
+            old_len = len(post.text_plain or "")
+            print(f"[{i+1}/{len(candidates)}] Fixing post {post.id} (len: {old_len})...", end="", flush=True)
+            
+            long_html = _fetch_long_text(req_session, post.id)
+            if long_html:
+                post.text_html = long_html
+                post.text_plain = _strip_html(long_html)
+                post.is_long_text = True 
+                fix_count += 1
+                consecutive_failures = 0  # Reset
+                new_len = len(post.text_plain)
+                print(f" -> Expanded to {new_len} chars.")
+                
+                # Save periodically to prevent data loss
+                if fix_count % 10 == 0:
+                     _rewrite_jsonl(jsonl_path, posts)
+                     print("  (Auto-saved progress)")
+
+                time.sleep(random.uniform(2.0, 4.0)) # Slower pace
+            else:
+                print(" -> Failed to fetch.")
+                consecutive_failures += 1
+                
+                if consecutive_failures >= 3:
+                    print("\n[Warning] Too many consecutive failures. API might be rate-limiting.")
+                    print("Cooling down for 60 seconds... (Do not close)")
+                    time.sleep(60)
+                    consecutive_failures = 0 # Reset to try again
+                else:
+                    time.sleep(2)
+                
+        browser.close()
+        
+    print(f"Fixed {fix_count} posts. Saving...")
+    _rewrite_jsonl(jsonl_path, posts)
+    print("Done.")
+
+
+def _rewrite_jsonl(path: Path, posts: List[WeiboPost]) -> None:
+    # Backup first
+    bak = path.with_suffix(".jsonl.bak")
+    if path.exists():
+         import shutil
+         shutil.copy(path, bak)
+    
+    with path.open("w", encoding="utf-8") as f:
+        for p in posts:
+            f.write(json.dumps(asdict(p), ensure_ascii=False) + "\n")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--uid", default="6347862377")
+    parser.add_argument("--out", default="data")
+    parser.add_argument("--cookie", default=None, help="Cookie string (used for API-only mode).")
+    parser.add_argument("--max-pages", type=int, default=None)
+    parser.add_argument("--sleep-min", type=float, default=2.0)
+    parser.add_argument("--sleep-max", type=float, default=5.0)
+    parser.add_argument(
+        "--stop-when-seen",
+        action="store_true",
+        help="Stop when reaching an existing post ID",
+    )
+    
+    parser.add_argument(
+        "--manual-auth",
+        action="store_true",
+        help="Open browser logic with manual login pause.",
+    )
+    parser.add_argument(
+        "--api-only",
+        action="store_true",
+        help="Force using the old API-only method (no browser scrolling).",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run browser in headless mode (default False for debugging/visibility).",
+    )
     parser.add_argument(
         "--max-no-new-scrolls",
         type=int,
         default=5,
         help="Stop after this many scrolls with no new content (default 5). Set higher (e.g. 100) to force deeper scrolling.",
     )
+    parser.add_argument(
+        "--fix-long-text",
+        action="store_true",
+        help="Scan existing data and fetch full text for truncated posts.",
+    )
 
     args = parser.parse_args()
 
     out_dir = Path(args.out)
     
+    if args.fix_long_text:
+        print("Running in FIX LONG TEXT mode.")
+        # Need to decide headless info
+        is_headless = args.headless
+        if args.manual_auth:
+             is_headless = False
+             
+        fix_existing_data(out_dir, args.manual_auth, is_headless, str(args.uid))
+        return
+
     # Decide mode
     # Default to Browser Intercept because API is flaky
     use_browser = True
