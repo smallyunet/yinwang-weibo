@@ -1,0 +1,1 @@
+python scripts/scrape_weibo.py --uid 6347862377 --out data --max-pages 2
