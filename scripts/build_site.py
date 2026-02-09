@@ -15,6 +15,36 @@ from typing import Any, Dict, List, Optional, Tuple
 from dateutil import parser as date_parser
 
 
+_BASE62_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def _base62_encode(num: int) -> str:
+    if num == 0:
+        return "0"
+    out = ""
+    while num > 0:
+        num, rem = divmod(num, 62)
+        out = _BASE62_ALPHABET[rem] + out
+    return out
+
+
+def _weibo_mid_to_bid(mid: Any) -> Optional[str]:
+    """Convert Weibo numeric mid to base62 bid used in web URLs."""
+    s = re.sub(r"\D", "", str(mid or ""))
+    if not s:
+        return None
+
+    chunks: List[str] = []
+    while s:
+        s, chunk = s[:-7], s[-7:]
+        encoded = _base62_encode(int(chunk))
+        if s:
+            encoded = encoded.rjust(4, "0")
+        chunks.append(encoded)
+
+    return "".join(reversed(chunks))
+
+
 def _read_posts_deduplicated(jsonl_path: Path) -> List[Dict[str, Any]]:
     """
     Reads posts from JSONL and removes duplicates based on 'id'.
@@ -141,6 +171,17 @@ def _post_html(p: Dict[str, Any]) -> str:
     
     text_html = p.get("text_html") or ""
     text_html = _clean_weibo_links(text_html)
+
+    origin_txt = ""
+    user_id = p.get("user_id")
+    mid = p.get("mid") or p.get("id")
+    bid = _weibo_mid_to_bid(mid) if user_id and mid else None
+    if bid:
+        origin_url = f"https://weibo.com/{user_id}/{bid}"
+        origin_txt = (
+            " · "
+            f"<a class='origin' href='{html.escape(origin_url)}' target='_blank' rel='noreferrer'>原微博</a>"
+        )
     
     pics_html = _render_images(p.get("pics") or [])
     
@@ -165,7 +206,7 @@ def _post_html(p: Dict[str, Any]) -> str:
         f"<article class='post' id='post-{pid}' data-year='{year}' data-month='{month}'>"
         f"<div class='meta'>"
         f"  <span class='date'><a href='#post-{pid}' class='permalink'>{created_str}</a></span>"
-        f"  <span class='source'>{source_txt}</span>"
+        f"  <span class='source'>{source_txt}{origin_txt}</span>"
         f"</div>"
         f"<div class='content'>"
         f"  <div class='text-block is-collapsed'>"
@@ -213,6 +254,27 @@ def _build_sidebar(posts: List[Dict[str, Any]]) -> str:
 def build(in_dir: Path, out_dir: Path, title: str) -> None:
     posts = _read_posts_deduplicated(in_dir / "posts.jsonl")
     posts = _sort_posts(posts)
+
+    archive_user_id = next((p.get("user_id") for p in posts if p.get("user_id")), "")
+    archive_user_screen_name = next(
+        (p.get("user_screen_name") for p in posts if p.get("user_screen_name")), ""
+    )
+    weibo_profile_url = f"https://weibo.com/u/{archive_user_id}" if archive_user_id else "https://weibo.com"
+    weibo_profile_label = (
+        f"@{archive_user_screen_name}"
+        if archive_user_screen_name
+        else (str(archive_user_id) if archive_user_id else "Weibo")
+    )
+    about_html = (
+        "<div class='about'>"
+        "  <div class='about-title'>说明</div>"
+        "  <div class='about-text'>"
+        f"    <div>原微博主页：<a href='{html.escape(weibo_profile_url)}' target='_blank' rel='noreferrer'>{html.escape(weibo_profile_label)}</a></div>"
+        "    <div>作者：王垠（微博用户）</div>"
+        "    <div>本页面用于备份归档，仅供个人整理与查阅，无任何商业目的。</div>"
+        "  </div>"
+        "</div>"
+    )
 
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / ".nojekyll").write_text("", encoding="utf-8")
@@ -335,6 +397,19 @@ def build(in_dir: Path, out_dir: Path, title: str) -> None:
     .nav-item:hover {{ background: var(--bg); color: var(--text-main); }}
     .nav-item.active {{ background: var(--accent); color: white; }}
     .nav-item .count {{ opacity: 0.7; font-size: 12px; }}
+
+        /* ABOUT */
+        .about {{
+            margin-top: 24px;
+            padding-top: 16px;
+            border-top: 1px solid var(--border);
+            font-size: 12px;
+            color: var(--text-sub);
+            line-height: 1.6;
+        }}
+        .about-title {{ font-weight: 700; color: var(--text-main); margin-bottom: 8px; font-size: 13px; }}
+        .about-text div {{ margin-bottom: 6px; }}
+        .about-text div:last-child {{ margin-bottom: 0; }}
 
     /* POST CARD */
     .post {{
@@ -525,6 +600,8 @@ def build(in_dir: Path, out_dir: Path, title: str) -> None:
     <div id="navMenu">
         {sidebar_html}
     </div>
+
+    {about_html}
   </aside>
 
   <main class="main-content">
