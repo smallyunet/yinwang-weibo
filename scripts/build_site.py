@@ -168,8 +168,11 @@ def _post_html(p: Dict[str, Any]) -> str:
         f"  <span class='source'>{source_txt}</span>"
         f"</div>"
         f"<div class='content'>"
-        f"  <div class='text'>{text_html}</div>"
-        f"  {retweet_html}"
+        f"  <div class='text-block is-collapsed'>"
+        f"    <div class='text'>{text_html}</div>"
+        f"    {retweet_html}"
+        f"  </div>"
+        f"  <button class='expand-toggle' type='button' hidden aria-expanded='false'>展开</button>"
         f"  {pics_html}"
         f"</div>"
         f"</article>"
@@ -242,6 +245,9 @@ def build(in_dir: Path, out_dir: Path, title: str) -> None:
       --shadow: 0 1px 3px rgba(0,0,0,0.05);
       --radius: 12px;
       --sidebar-width: 240px;
+            --collapse-max-height: 220px;
+            --collapse-fade-height: 70px;
+            --pics-max-width: 520px;
     }}
     @media (prefers-color-scheme: dark) {{
       :root {{
@@ -341,6 +347,32 @@ def build(in_dir: Path, out_dir: Path, title: str) -> None:
     .meta {{ display: flex; gap: 8px; margin-bottom: 12px; font-size: 13px; color: var(--text-sub); }}
     .date {{ font-weight: 500; }}
     .text {{ font-size: 16px; margin-bottom: 12px; overflow-wrap: break-word; }}
+
+        /* COLLAPSE / EXPAND */
+        .text-block {{ position: relative; }}
+        .text-block.is-collapsed {{ max-height: var(--collapse-max-height); overflow: hidden; }}
+        .text-block.is-collapsed::after {{
+            content: "";
+            position: absolute;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            height: var(--collapse-fade-height);
+            background: linear-gradient(to bottom, rgba(0,0,0,0), var(--card-bg));
+            pointer-events: none;
+        }}
+        .expand-toggle {{
+            display: inline-block;
+            margin: 6px 0 0;
+            padding: 0;
+            border: 0;
+            background: transparent;
+            color: var(--link);
+            font-size: 14px;
+            cursor: pointer;
+        }}
+        .expand-toggle[hidden] {{ display: none !important; }}
+        .expand-toggle:hover {{ text-decoration: underline; }}
     
     .retweet {{
       background: var(--bg);
@@ -353,7 +385,7 @@ def build(in_dir: Path, out_dir: Path, title: str) -> None:
     .rt-user {{ font-weight: 600; margin-bottom: 4px; color: var(--text-main); }}
 
     /* IMAGES */
-    .pics {{ display: grid; gap: 6px; margin-top: 12px; }}
+    .pics {{ display: grid; gap: 6px; margin-top: 12px; max-width: var(--pics-max-width); }}
     .img-item {{ display: block; position: relative; border-radius: 8px; background: #f0f0f0; overflow: hidden; cursor: zoom-in; }}
     .img-item img {{ display: block; width: 100%; height: 100%; object-fit: cover; }}
     .pics-1 {{ max-width: 60%; grid-template-columns: 1fr; }} 
@@ -375,6 +407,11 @@ def build(in_dir: Path, out_dir: Path, title: str) -> None:
 
     /* MOBILE: App-like Experience */
     @media (max-width: 768px) {{
+                :root {{
+                    --collapse-max-height: 260px;
+                    --collapse-fade-height: 80px;
+                    --pics-max-width: 100%;
+                }}
         body {{ 
             flex-direction: column; 
             background: var(--card-bg); /* Seamless background */
@@ -618,8 +655,39 @@ def build(in_dir: Path, out_dir: Path, title: str) -> None:
             }}
         }});
     }}
+
+    // 3. Collapse / Expand Logic
+    function setupCollapsibles() {{
+        document.querySelectorAll('.post').forEach(post => {{
+            const block = post.querySelector('.text-block');
+            const btn = post.querySelector('.expand-toggle');
+            if (!block || !btn) return;
+
+            if (!btn.dataset.bound) {{
+                btn.addEventListener('click', () => {{
+                    const isCollapsed = block.classList.toggle('is-collapsed');
+                    btn.textContent = isCollapsed ? '展开' : '收起';
+                    btn.setAttribute('aria-expanded', String(!isCollapsed));
+                }});
+                btn.dataset.bound = '1';
+            }}
+
+            // Default: collapsed; only show toggle if overflow exists
+            block.classList.add('is-collapsed');
+            btn.textContent = '展开';
+            btn.setAttribute('aria-expanded', 'false');
+
+            const needsToggle = block.scrollHeight > block.clientHeight + 4;
+            if (needsToggle) {{
+                btn.hidden = false;
+            }} else {{
+                btn.hidden = true;
+                block.classList.remove('is-collapsed');
+            }}
+        }});
+    }}
     
-    // 3. Lightbox Logic
+    // 4. Lightbox Logic
     document.querySelectorAll('.img-item').forEach(link => {{
         link.addEventListener('click', (e) => {{
             e.preventDefault();
@@ -633,8 +701,9 @@ def build(in_dir: Path, out_dir: Path, title: str) -> None:
         lightbox.classList.remove('active');
     }});
 
-    // Run
-    init();
+        // Run
+        init();
+        setupCollapsibles();
   </script>
 </body>
 </html>
