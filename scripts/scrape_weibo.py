@@ -200,10 +200,17 @@ def _to_post(mblog: Dict[str, Any], uid: str) -> WeiboPost:
     )
 
 
-def _load_existing_ids(jsonl_path: Path) -> Set[str]:
+def _post_from_dict(obj: Dict[str, Any]) -> Optional[WeiboPost]:
+    try:
+        return WeiboPost(**obj)
+    except Exception:
+        return None
+
+
+def _load_existing_posts(jsonl_path: Path) -> Dict[str, WeiboPost]:
     if not jsonl_path.exists():
-        return set()
-    ids: Set[str] = set()
+        return {}
+    posts: Dict[str, WeiboPost] = {}
     with jsonl_path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -211,12 +218,16 @@ def _load_existing_ids(jsonl_path: Path) -> Set[str]:
                 continue
             try:
                 obj = json.loads(line)
-                pid = str(obj.get("id") or "")
-                if pid:
-                    ids.add(pid)
             except Exception:
                 continue
-    return ids
+            post = _post_from_dict(obj)
+            if post and post.id:
+                posts[post.id] = post
+    return posts
+
+
+def _load_existing_ids(jsonl_path: Path) -> Set[str]:
+    return set(_load_existing_posts(jsonl_path).keys())
 
 
 def _append_posts(jsonl_path: Path, posts: List[WeiboPost]) -> None:
@@ -226,11 +237,11 @@ def _append_posts(jsonl_path: Path, posts: List[WeiboPost]) -> None:
             f.write(json.dumps(asdict(p), ensure_ascii=False) + "\n")
 
 
-def _download_one(session: requests.Session, url: str, out_path: Path) -> bool:
+def _download_one(session: requests.Session, url: str, out_path: Path, overwrite: bool = False) -> bool:
     if not url:
         return False
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.exists() and out_path.stat().st_size > 0:
+    if out_path.exists() and out_path.stat().st_size > 0 and not overwrite:
         return True
 
     r = session.get(url, stream=True, timeout=30)
@@ -260,6 +271,7 @@ def _download_pics_for_post(
     session: requests.Session,
     post: WeiboPost,
     images_root: Path,
+    overwrite: bool = False,
 ) -> List[Dict[str, Any]]:
     # Returns pics with extra fields such as local_path
     created = date_parser.parse(post.created_at.replace("Z", "+00:00"))
@@ -273,9 +285,118 @@ def _download_pics_for_post(
         filename = _safe_filename(f"{post.id}_{idx}{ext}")
         local_rel = Path(date_dir) / filename
         local_abs = images_root / local_rel
-        ok = _download_one(session, url, local_abs)
+        ok = _download_one(session, url, local_abs, overwrite=overwrite)
         out.append({**pic, "local_path": str(local_rel).replace(os.sep, "/"), "downloaded": ok})
     return out
+
+
+def _normalize_pics_for_compare(pics: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for pic in pics or []:
+        if not isinstance(pic, dict):
+            continue
+        normalized.append(
+            {
+                "index": pic.get("index"),
+                "url": pic.get("url"),
+            }
+        )
+    return normalized
+
+
+def _post_compare_dict(post: WeiboPost) -> Dict[str, Any]:
+    data = asdict(post)
+    data["pics"] = _normalize_pics_for_compare(post.pics)
+    return data
+
+
+def _post_has_changed(existing: WeiboPost, incoming: WeiboPost) -> bool:
+    return _post_compare_dict(existing) != _post_compare_dict(incoming)
+
+
+def _existing_pic_lookup(post: WeiboPost) -> Dict[Tuple[Any, Any], Dict[str, Any]]:
+    lookup: Dict[Tuple[Any, Any], Dict[str, Any]] = {}
+    for pic in post.pics or []:
+        if not isinstance(pic, dict):
+            continue
+        key = (pic.get("index"), pic.get("url"))
+        lookup[key] = pic
+    return lookup
+
+
+def _merge_existing_pic_metadata(existing: WeiboPost, incoming: WeiboPost) -> List[Dict[str, Any]]:
+    existing_lookup = _existing_pic_lookup(existing)
+    merged: List[Dict[str, Any]] = []
+    for pic in incoming.pics or []:
+        if not isinstance(pic, dict):
+            continue
+        key = (pic.get("index"), pic.get("url"))
+        existing_pic = existing_lookup.get(key)
+        if existing_pic:
+            merged.append({**pic, **{k: v for k, v in existing_pic.items() if k not in {"index", "url"}}})
+        else:
+            merged.append(pic)
+    return merged
+
+
+def _prepare_post_media(
+    post: WeiboPost,
+    existing_post: Optional[WeiboPost],
+    req_session: Optional[requests.Session],
+    images_root: Path,
+    redownload_images_on_update: bool,
+) -> None:
+    if not post.pics:
+        return
+    if existing_post and not redownload_images_on_update:
+        post.pics = _merge_existing_pic_metadata(existing_post, post)
+    if req_session:
+        should_overwrite = bool(existing_post and redownload_images_on_update)
+        post.pics = _download_pics_for_post(req_session, post, images_root, overwrite=should_overwrite)
+
+
+def _upsert_posts(
+    jsonl_path: Path,
+    posts: List[WeiboPost],
+    existing_posts: Dict[str, WeiboPost],
+    req_session: Optional[requests.Session],
+    images_root: Path,
+    redownload_images_on_update: bool,
+) -> Tuple[int, int]:
+    batch_by_id: Dict[str, WeiboPost] = {}
+    for post in posts:
+        if post.id:
+            batch_by_id[post.id] = post
+
+    inserted = 0
+    updated = 0
+    changed = False
+
+    for post in batch_by_id.values():
+        existing_post = existing_posts.get(post.id)
+        if existing_post is None:
+            _prepare_post_media(post, None, req_session, images_root, redownload_images_on_update)
+            existing_posts[post.id] = post
+            inserted += 1
+            changed = True
+            continue
+
+        if not _post_has_changed(existing_post, post):
+            continue
+
+        _prepare_post_media(post, existing_post, req_session, images_root, redownload_images_on_update)
+        existing_posts[post.id] = post
+        updated += 1
+        changed = True
+
+    if changed:
+        ordered_posts = sorted(
+            existing_posts.values(),
+            key=lambda p: (p.created_at, p.id),
+        )
+        _rewrite_jsonl(jsonl_path, ordered_posts)
+
+    return inserted, updated
 
 
 def _fetch_long_text(session: requests.Session, pid: str) -> Optional[str]:
@@ -295,33 +416,38 @@ def _fetch_long_text(session: requests.Session, pid: str) -> Optional[str]:
     return None
 
 
-def _save_batch(jsonl_path: Path, posts: List[WeiboPost], existing_ids: Set[str], req_session: requests.Session, images_root: Path) -> None:
-    # Helper to save any pending unique posts when stopping early
-    unique_batch = []
-    for p in posts:
-        if p.id not in existing_ids:
-            unique_batch.append(p)
-            existing_ids.add(p.id)
-    
-    if unique_batch:
-        # 1. Fetch long text if needed
-        for p in unique_batch:
-            if p.is_long_text and req_session:
-                print(f"  Fetching long text for {p.id}...")
-                long_html = _fetch_long_text(req_session, p.id)
-                if long_html:
-                    p.text_html = long_html
-                    p.text_plain = _strip_html(long_html)
-                    # Small sleep to be nice
-                    time.sleep(0.5)
+def _save_batch(
+    jsonl_path: Path,
+    posts: List[WeiboPost],
+    existing_posts: Dict[str, WeiboPost],
+    req_session: Optional[requests.Session],
+    images_root: Path,
+    redownload_images_on_update: bool,
+) -> Tuple[int, int]:
+    pending_posts = [p for p in posts if p.id]
+    if not pending_posts:
+        return 0, 0
 
-        # 2. Download images
-        for p in unique_batch:
-            if p.pics and req_session:
-                    p.pics = _download_pics_for_post(req_session, p, images_root)
-        
-        _append_posts(jsonl_path, unique_batch)
-        print(f"Saved final batch of {len(unique_batch)} posts before stopping.")
+    for p in pending_posts:
+        if p.is_long_text and req_session:
+            print(f"  Fetching long text for {p.id}...")
+            long_html = _fetch_long_text(req_session, p.id)
+            if long_html:
+                p.text_html = long_html
+                p.text_plain = _strip_html(long_html)
+                time.sleep(0.5)
+
+    inserted, updated = _upsert_posts(
+        jsonl_path,
+        pending_posts,
+        existing_posts,
+        req_session,
+        images_root,
+        redownload_images_on_update,
+    )
+    if inserted or updated:
+        print(f"Saved final batch before stopping. inserted={inserted}, updated={updated}.")
+    return inserted, updated
 
 
 def fetch_via_browser_intercept(
@@ -335,6 +461,7 @@ def fetch_via_browser_intercept(
     manual_auth: bool = False,
     headless: bool = False,
     max_no_new_scrolls: int = 5,
+    redownload_images_on_update: bool = False,
 ) -> None:
     if not HAS_PLAYWRIGHT:
         raise ImportError("Playwright is not installed. Please run `pip install playwright` and `playwright install`.")
@@ -342,9 +469,8 @@ def fetch_via_browser_intercept(
     jsonl_path = out_dir / "posts.jsonl"
     images_root = out_dir / "images"
     
-    # Always load existing IDs to prevent duplicates in the file
-    existing_ids = _load_existing_ids(jsonl_path)
-    print(f"Loaded {len(existing_ids)} existing post IDs.")
+    existing_posts = _load_existing_posts(jsonl_path)
+    print(f"Loaded {len(existing_posts)} existing posts.")
 
     # We need a requests session for downloading images later.
     # We will initialize it after we get cookies from the browser.
@@ -383,12 +509,12 @@ def fetch_via_browser_intercept(
                     new_batch = []
                     for mblog in mblogs:
                         post = _to_post(mblog, uid)
-                        if post.id and post.id not in existing_ids:
-                             new_batch.append(post)
+                        if post.id:
+                            new_batch.append(post)
 
                     if new_batch:
                         captured_posts.extend(new_batch)
-                        print(f"  -> Intercepted {len(new_batch)} new posts from API response.")
+                        print(f"  -> Intercepted {len(new_batch)} posts from API response.")
                 except Exception:
                     # Ignore parsing errors from unrelated requests
                     pass
@@ -470,42 +596,39 @@ def fetch_via_browser_intercept(
                     # If any of the captured posts are already known, it implies we hit the "old" part of timeline.
                     # (Assuming reverse chronological order implementation by Weibo)
                     for p in captured_posts:
-                        if p.id in existing_ids:
+                        if p.id in existing_posts:
                             print(f"Encountered existing post {p.id}. Stopping (stop-when-seen).")
-                            _save_batch(jsonl_path, captured_posts, existing_ids, req_session, images_root)
+                            _save_batch(
+                                jsonl_path,
+                                captured_posts,
+                                existing_posts,
+                                req_session,
+                                images_root,
+                                redownload_images_on_update,
+                            )
                             return
 
-                # Deduplicate and save
-                unique_batch = []
-                for p in captured_posts:
-                    if p.id not in existing_ids:
-                        unique_batch.append(p)
-                        existing_ids.add(p.id)
-                
-                captured_posts.clear() # Clear buffer
-                
-                if unique_batch:
-                    # 1. Fetch long text
-                    for p in unique_batch:
-                        if p.is_long_text and req_session:
-                            print(f"  Fetching long text for {p.id}...")
-                            long_html = _fetch_long_text(req_session, p.id)
-                            if long_html:
-                                p.text_html = long_html
-                                p.text_plain = _strip_html(long_html)
-                                time.sleep(random.uniform(0.3, 0.8))
+                batch = captured_posts[:]
+                captured_posts.clear()
 
-                    # 2. Download images
-                    for p in unique_batch:
-                        if p.pics and req_session:
-                             p.pics = _download_pics_for_post(req_session, p, images_root)
-                    
-                    _append_posts(jsonl_path, unique_batch)
-                    total_saved += len(unique_batch)
-                    print(f"Scroll {scroll_count}: Saved {len(unique_batch)} posts. (Total: {total_saved})")
+                inserted, updated = _save_batch(
+                    jsonl_path,
+                    batch,
+                    existing_posts,
+                    req_session,
+                    images_root,
+                    redownload_images_on_update,
+                )
+
+                if inserted or updated:
+                    total_saved += inserted
+                    print(
+                        f"Scroll {scroll_count}: inserted={inserted}, updated={updated}. "
+                        f"(Total inserted: {total_saved})"
+                    )
                     consecutive_no_new = 0
                 else:
-                    print(f"Scroll {scroll_count}: No new unique posts found (duplicates filtered).")
+                    print(f"Scroll {scroll_count}: No inserted or updated posts found.")
                     consecutive_no_new += 1
             else:
                 print(f"Scroll {scroll_count}: No API responses intercepted.")
@@ -730,6 +853,11 @@ def main() -> None:
         action="store_true",
         help="Scan existing data and fetch full text for truncated posts.",
     )
+    parser.add_argument(
+        "--redownload-images-on-update",
+        action="store_true",
+        help="When an existing post changes, re-download its images instead of reusing existing local files.",
+    )
 
     args = parser.parse_args()
 
@@ -775,18 +903,12 @@ def main() -> None:
             manual_auth=args.manual_auth,
             headless=is_headless,
             max_no_new_scrolls=args.max_no_new_scrolls,
+            redownload_images_on_update=args.redownload_images_on_update,
         )
     else:
-        print("Using Legacy API Mode.")
-        cookie = args.cookie or os.environ.get("WEIBO_COOKIE")
-        fetch_all(
-            uid=str(args.uid),
-            out_dir=out_dir,
-            cookie=cookie,
-            max_pages=args.max_pages,
-            sleep_min=args.sleep_min,
-            sleep_max=args.sleep_max,
-            stop_when_seen=bool(args.stop_when_seen),
+        raise RuntimeError(
+            "Legacy API mode is not available in this script. "
+            "Use the default browser intercept mode, or implement fetch_all before using --api-only."
         )
 
 
