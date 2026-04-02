@@ -653,7 +653,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--uid", default="6347862377")
     parser.add_argument("--out", default="data")
-    parser.add_argument("--cookie", default=None, help="Cookie string (used for API-only mode).")
+    parser.add_argument("--cookie", default=None, help="Deprecated legacy option. Browser mode manages cookies automatically.")
     parser.add_argument("--max-pages", type=int, default=None)
     parser.add_argument("--sleep-min", type=float, default=2.0)
     parser.add_argument("--sleep-max", type=float, default=5.0)
@@ -671,7 +671,7 @@ def main() -> None:
     parser.add_argument(
         "--api-only",
         action="store_true",
-        help="Force using the old API-only method (no browser scrolling).",
+        help="Deprecated legacy mode. Not supported by this script.",
     )
     parser.add_argument(
         "--headless",
@@ -879,8 +879,10 @@ def main() -> None:
     if args.api_only:
         use_browser = False
     elif not HAS_PLAYWRIGHT:
-        print("Playwright not installed, falling back to API-only mode.")
-        use_browser = False
+        raise RuntimeError(
+            "Playwright is required for the default browser intercept mode, but it is not installed. "
+            "Install dependencies with `pip install -r requirements.txt` and then run `playwright install`."
+        )
 
     if use_browser:
         print("Using Browser Intercept Mode (Recommended).")

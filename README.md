@@ -32,14 +32,8 @@ python scripts/scrape_weibo.py --uid 6347862377 --out data --manual-auth
 
 This will open a browser window. Log in, then press Enter in your terminal to continue.
 
-**Alternative: Static Cookie**
-
-If you prefer to provide a cookie manually without using Playwright:
-
-```bash
-export WEIBO_COOKIE='SUB=...; SUBP=...;'
-python scripts/scrape_weibo.py --uid 6347862377 --out data
-```
+The legacy cookie/API-only path is no longer supported by the current script entrypoint.
+Install Playwright and use the browser mode above.
 
 3) Build the static site (outputs to `docs/`):
 
