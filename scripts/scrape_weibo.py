@@ -19,9 +19,10 @@ from dateutil import parser as date_parser
 
 # Try importing playwright for optional browser-based auth
 try:
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
     HAS_PLAYWRIGHT = True
 except ImportError:
+    PlaywrightTimeoutError = RuntimeError
     HAS_PLAYWRIGHT = False
 
 
@@ -30,6 +31,9 @@ DEFAULT_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/121.0.0.0 Safari/537.36"
 )
+
+PROFILE_NAVIGATION_TIMEOUT_MS = 30_000
+HEADED_NAVIGATION_PROBE_TIMEOUT_MS = 8_000
 
 
 @dataclass
@@ -90,6 +94,47 @@ def _requests_session(cookie: Optional[str]) -> requests.Session:
     if cookie:
         s.headers["Cookie"] = cookie
     return s
+
+
+def _goto_profile(page: Any, url: str, timeout_ms: int = PROFILE_NAVIGATION_TIMEOUT_MS) -> None:
+    # m.weibo.cn can keep background requests active indefinitely, so networkidle is unreliable.
+    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+    page.wait_for_load_state("load", timeout=10_000)
+
+
+def _new_mobile_page(playwright: Any, headless: bool) -> Tuple[Any, Any, Any]:
+    browser = playwright.chromium.launch(headless=headless)
+    context = browser.new_context(
+        user_agent=DEFAULT_UA,
+        viewport={"width": 390, "height": 844},
+        device_scale_factor=3,
+        is_mobile=True,
+        has_touch=True,
+    )
+    page = context.new_page()
+    return browser, context, page
+
+
+def _ensure_profile_page(playwright: Any, url: str, headless: bool, manual_auth: bool) -> Tuple[Any, Any, Any, bool]:
+    print(f"Launching browser (headless={headless})...")
+    browser, context, page = _new_mobile_page(playwright, headless=headless)
+    try:
+        timeout_ms = PROFILE_NAVIGATION_TIMEOUT_MS
+        if not headless and not manual_auth:
+            timeout_ms = HEADED_NAVIGATION_PROBE_TIMEOUT_MS
+        _goto_profile(page, url, timeout_ms=timeout_ms)
+        return browser, context, page, headless
+    except PlaywrightTimeoutError:
+        if headless or manual_auth or page.url != "about:blank":
+            browser.close()
+            raise
+
+        browser.close()
+        print("Headed Playwright browser is stuck on about:blank on this machine; falling back to headless mode.")
+        print("Launching browser (headless=True)...")
+        browser, context, page = _new_mobile_page(playwright, headless=True)
+        _goto_profile(page, url)
+        return browser, context, page, True
 
 
 def _parse_json_response(r: requests.Response) -> Dict[str, Any]:
@@ -479,17 +524,6 @@ def fetch_via_browser_intercept(
     with sync_playwright() as p:
         # If manual_auth is True, we must show the browser
         is_headless = headless and not manual_auth
-        
-        print(f"Launching browser (headless={is_headless})...")
-        browser = p.chromium.launch(headless=is_headless)
-        context = browser.new_context(
-            user_agent=DEFAULT_UA,
-            viewport={"width": 390, "height": 844},
-            device_scale_factor=3,
-            is_mobile=True,
-            has_touch=True,
-        )
-        page = context.new_page()
 
         # Shared state for the interceptor
         captured_posts: List[WeiboPost] = []
@@ -520,11 +554,15 @@ def fetch_via_browser_intercept(
                     pass
 
         # Register listener
-        page.on("response", handle_response)
-
         url = f"https://m.weibo.cn/u/{uid}"
         print(f"Navigating to profile: {url}")
-        page.goto(url, wait_until="networkidle")
+        browser, context, page, is_headless = _ensure_profile_page(
+            p,
+            url,
+            headless=is_headless,
+            manual_auth=manual_auth,
+        )
+        page.on("response", handle_response)
 
         if manual_auth:
             print("-" * 60)
@@ -725,21 +763,16 @@ def fix_existing_data(out_dir: Path, manual_auth: bool, headless: bool, uid: str
     # Get session
     with sync_playwright() as p:
         is_headless = headless and not manual_auth
-        print(f"Launching browser (headless={is_headless})...")
-        browser = p.chromium.launch(headless=is_headless)
-        context = browser.new_context(
-            user_agent=DEFAULT_UA,
-            viewport={"width": 390, "height": 844},
-            device_scale_factor=3,
-            is_mobile=True,
-            has_touch=True,
-        )
-        page = context.new_page()
         
         # Go to profile to get cookie and look correct
         url = f"https://m.weibo.cn/u/{uid}"
         print(f"Navigating to profile: {url}")
-        page.goto(url, wait_until="networkidle")
+        browser, context, page, is_headless = _ensure_profile_page(
+            p,
+            url,
+            headless=is_headless,
+            manual_auth=manual_auth,
+        )
         
         if manual_auth:
              print("-" * 60)
